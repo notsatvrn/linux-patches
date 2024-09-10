@@ -1,0 +1,21 @@
+This patch fixes pp_table modification on newer AMD GPUs.
+
+--- a/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
++++ b/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
+@@ -1390,12 +1402,16 @@ int amdgpu_dpm_set_pp_table(struct amdgpu_device *adev,
+ 	if (!pp_funcs->set_pp_table)
+ 		return -EOPNOTSUPP;
+ 
++	amdgpu_gfx_off_ctrl(adev, false);
++
+ 	mutex_lock(&adev->pm.mutex);
+ 	ret = pp_funcs->set_pp_table(adev->powerplay.pp_handle,
+ 				     buf,
+ 				     size);
+ 	mutex_unlock(&adev->pm.mutex);
+ 
++	amdgpu_gfx_off_ctrl(adev, true);
++
+ 	return ret;
+ }
+ 

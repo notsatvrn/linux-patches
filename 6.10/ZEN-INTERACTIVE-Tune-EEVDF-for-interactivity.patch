@@ -1,0 +1,90 @@
+From 2dc4d9b7738f0d37c166db11933816e24cb098bb Mon Sep 17 00:00:00 2001
+From: "Jan Alexander Steffens (heftig)" <heftig@archlinux.org>
+Date: Tue, 31 Oct 2023 19:03:10 +0100
+Subject: [PATCH] ZEN: INTERACTIVE: Tune EEVDF for interactivity
+
+5.7:
+Take "sysctl_sched_nr_migrate" tune from early XanMod builds of 128. As
+of 5.7, XanMod uses 256 but that may affect applications that require
+timely response to IRQs.
+
+5.15:
+Per [a comment][1] on our ZEN INTERACTIVE commit, reducing the cost of
+migration causes the system less responsive under high load.  Most
+likely the combination of reduced migration cost + the higher number of
+tasks that can be migrated at once contributes to this.
+
+To better handle this situation, restore the mainline migration cost
+value and also reduce the max number of tasks that can be migrated in
+batch from 128 to 64.
+
+If this doesn't help, we'll restore the reduced migration cost and keep
+total number of tasks that can be migrated at once to 32.
+
+[1]: https://github.com/zen-kernel/zen-kernel/commit/be5ba234ca0a5aabe74bfc7e1f636f085bd3823c#commitcomment-63159674
+
+6.6:
+Port the tuning to EEVDF, which removed a couple of settings.
+
+6.7:
+Instead of increasing the number of tasks that migrate at once, migrate
+the amount acceptable for PREEMPT_RT, but reduce the cost so migrations
+occur more often.
+
+This should make CFS/EEVDF behave more like out-of-tree schedulers that
+aggressively use idle cores to reduce latency, but without the jank
+caused by rebalancing too many tasks at once.
+---
+ kernel/sched/fair.c  | 12 ++++++------
+ kernel/sched/sched.h |  4 ----
+ 2 files changed, 6 insertions(+), 10 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 483c137..30ae652 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -71,12 +71,12 @@ unsigned int sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_LOG;
+ /*
+  * Minimal preemption granularity for CPU-bound tasks:
+  *
+- * (default: 0.75 msec * (1 + ilog(ncpus)), units: nanoseconds)
++ * (default: 0.40 msec * (1 + ilog(ncpus)), units: nanoseconds)
+  */
+-unsigned int sysctl_sched_base_slice			= 750000ULL;
+-static unsigned int normalized_sysctl_sched_base_slice	= 750000ULL;
++unsigned int sysctl_sched_base_slice			= 400000ULL;
++static unsigned int normalized_sysctl_sched_base_slice	= 400000ULL;
+
+-const_debug unsigned int sysctl_sched_migration_cost	= 500000UL;
++const_debug unsigned int sysctl_sched_migration_cost	= 250000UL;
+
+ static int __init setup_sched_thermal_decay_shift(char *str)
+ {
+@@ -119,9 +119,9 @@ int __weak arch_asym_cpu_priority(int cpu)
+  * to consumption or the quota being specified to be smaller than the slice)
+  * we will always only issue the remaining available time.
+  *
+- * (default: 5 msec, units: microseconds)
++ * (default: 3 msec, units: microseconds)
+  */
+-static unsigned int sysctl_sched_cfs_bandwidth_slice		= 5000UL;
++static unsigned int sysctl_sched_cfs_bandwidth_slice		= 3000UL;
+ #endif
+
+ #ifdef CONFIG_NUMA_BALANCING
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 38aeedd..402037e 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2544,11 +2544,7 @@ extern void deactivate_task(struct rq *rq, struct task_struct *p, int flags);
+
+ extern void wakeup_preempt(struct rq *rq, struct task_struct *p, int flags);
+
+-#ifdef CONFIG_PREEMPT_RT
+ #define SCHED_NR_MIGRATE_BREAK 8
+-#else
+-#define SCHED_NR_MIGRATE_BREAK 32
+-#endif
+
+ extern const_debug unsigned int sysctl_sched_nr_migrate;
+ extern const_debug unsigned int sysctl_sched_migration_cost;

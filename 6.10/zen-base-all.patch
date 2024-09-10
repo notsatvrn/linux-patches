@@ -1,0 +1,1244 @@
+From a761208ac1d7ba808a196b13916f34143dc0acdc Mon Sep 17 00:00:00 2001
+From: Steven Barrett <steven@liquorix.net>
+Date: Sat, 30 Jan 2021 11:34:18 -0600
+Subject: [PATCH] ZEN: Add ACS override support
+
+Source: https://gitlab.com/Queuecumber/linux-acs-override/-/raw/master/workspaces/5.10.4/acso.patch
+---
+ .../admin-guide/kernel-parameters.txt         |   9 ++
+ drivers/pci/quirks.c                          | 101 ++++++++++++++++++
+ 2 files changed, 110 insertions(+)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 27ec49af1bf27b..db94b472543f5e 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -4447,6 +4447,15 @@
+ 		nomsi		[MSI] If the PCI_MSI kernel config parameter is
+ 				enabled, this kernel boot option can be used to
+ 				disable the use of MSI interrupts system-wide.
++		pcie_acs_override =
++					[PCIE] Override missing PCIe ACS support for:
++				downstream
++					All downstream ports - full ACS capabilities
++				multfunction
++					All multifunction devices - multifunction ACS subset
++				id:nnnn:nnnn
++					Specfic device - full ACS capabilities
++					Specified as vid:did (vendor/device ID) in hex
+ 		noioapicquirk	[APIC] Disable all boot interrupt quirks.
+ 				Safety option to keep boot IRQs enabled. This
+ 				should never be necessary.
+diff --git a/drivers/pci/quirks.c b/drivers/pci/quirks.c
+index 568410e64ce64e..192d0557fb0579 100644
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@ -3732,6 +3732,106 @@ static void quirk_no_bus_reset(struct pci_dev *dev)
+ 	dev->dev_flags |= PCI_DEV_FLAGS_NO_BUS_RESET;
+ }
+ 
++static bool acs_on_downstream;
++static bool acs_on_multifunction;
++
++#define NUM_ACS_IDS 16
++struct acs_on_id {
++	unsigned short vendor;
++	unsigned short device;
++};
++static struct acs_on_id acs_on_ids[NUM_ACS_IDS];
++static u8 max_acs_id;
++
++static __init int pcie_acs_override_setup(char *p)
++{
++	if (!p)
++		return -EINVAL;
++
++	while (*p) {
++		if (!strncmp(p, "downstream", 10))
++			acs_on_downstream = true;
++		if (!strncmp(p, "multifunction", 13))
++			acs_on_multifunction = true;
++		if (!strncmp(p, "id:", 3)) {
++			char opt[5];
++			int ret;
++			long val;
++
++			if (max_acs_id >= NUM_ACS_IDS - 1) {
++				pr_warn("Out of PCIe ACS override slots (%d)\n",
++						NUM_ACS_IDS);
++				goto next;
++			}
++
++			p += 3;
++			snprintf(opt, 5, "%s", p);
++			ret = kstrtol(opt, 16, &val);
++			if (ret) {
++				pr_warn("PCIe ACS ID parse error %d\n", ret);
++				goto next;
++			}
++			acs_on_ids[max_acs_id].vendor = val;
++
++			p += strcspn(p, ":");
++			if (*p != ':') {
++				pr_warn("PCIe ACS invalid ID\n");
++				goto next;
++			}
++
++			p++;
++			snprintf(opt, 5, "%s", p);
++			ret = kstrtol(opt, 16, &val);
++			if (ret) {
++				pr_warn("PCIe ACS ID parse error %d\n", ret);
++				goto next;
++			}
++			acs_on_ids[max_acs_id].device = val;
++			max_acs_id++;
++		}
++next:
++		p += strcspn(p, ",");
++		if (*p == ',')
++			p++;
++	}
++
++	if (acs_on_downstream || acs_on_multifunction || max_acs_id)
++		pr_warn("Warning: PCIe ACS overrides enabled; This may allow non-IOMMU protected peer-to-peer DMA\n");
++
++	return 0;
++}
++early_param("pcie_acs_override", pcie_acs_override_setup);
++
++static int pcie_acs_overrides(struct pci_dev *dev, u16 acs_flags)
++{
++	int i;
++
++	/* Never override ACS for legacy devices or devices with ACS caps */
++	if (!pci_is_pcie(dev) ||
++		pci_find_ext_capability(dev, PCI_EXT_CAP_ID_ACS))
++			return -ENOTTY;
++
++	for (i = 0; i < max_acs_id; i++)
++		if (acs_on_ids[i].vendor == dev->vendor &&
++			acs_on_ids[i].device == dev->device)
++				return 1;
++
++	switch (pci_pcie_type(dev)) {
++	case PCI_EXP_TYPE_DOWNSTREAM:
++	case PCI_EXP_TYPE_ROOT_PORT:
++		if (acs_on_downstream)
++			return 1;
++		break;
++	case PCI_EXP_TYPE_ENDPOINT:
++	case PCI_EXP_TYPE_UPSTREAM:
++	case PCI_EXP_TYPE_LEG_END:
++	case PCI_EXP_TYPE_RC_END:
++		if (acs_on_multifunction && dev->multifunction)
++			return 1;
++	}
++
++	return -ENOTTY;
++}
+ /*
+  * Some NVIDIA GPU devices do not work with bus reset, SBR needs to be
+  * prevented for those affected devices.
+@@ -5143,6 +5243,7 @@ static const struct pci_dev_acs_enabled {
+ 	{ PCI_VENDOR_ID_ZHAOXIN, PCI_ANY_ID, pci_quirk_zhaoxin_pcie_ports_acs },
+ 	/* Wangxun nics */
+ 	{ PCI_VENDOR_ID_WANGXUN, PCI_ANY_ID, pci_quirk_wangxun_nic_acs },
++	{ PCI_ANY_ID, PCI_ANY_ID, pcie_acs_overrides },
+ 	{ 0 }
+ };
+
+From ab9eefaf928d1345fa09babb311b526b8b6142aa Mon Sep 17 00:00:00 2001
+From: Daniel Drake <drake@endlessm.com>
+Date: Tue, 4 Jun 2019 14:51:21 +0800
+Subject: [PATCH] ZEN: PCI: Add Intel remapped NVMe device support
+
+Contains:
+  - PCI: Add Intel remapped NVMe device support
+
+    Consumer products that are configured by default to run the Intel SATA AHCI
+    controller in "RAID" or "Intel RST Premium With Intel Optane System
+    Acceleration" mode are becoming increasingly prevalent.
+
+    Unde this mode, NVMe devices are remapped into the SATA device and become
+    hidden from the PCI bus, which means that Linux users cannot access their
+    storage devices unless they go into the firmware setup menu to revert back
+    to AHCI mode - assuming such option is available. Lack of support for this
+    mode is also causing complications for vendors who distribute Linux.
+
+    Add support for the remapped NVMe mode by creating a virtual PCI bus,
+    where the AHCI and NVMe devices are presented separately, allowing the
+    ahci and nvme drivers to bind in the normal way.
+
+    Unfortunately the NVMe device configuration space is inaccesible under
+    this scheme, so we provide a fake one, and hope that no DeviceID-based
+    quirks are needed. The interrupt is shared between the AHCI and NVMe
+    devices.
+
+    Allow pci_real_dma_dev() to traverse back to the real DMA device from
+    the PCI devices created on our virtual bus, in case the iommu driver
+    will be involved with data transfers here.
+
+    The existing ahci driver is modified to not claim devices where remapped
+    NVMe devices are present, allowing this new driver to step in.
+
+    The details of the remapping scheme came from patches previously
+    posted by Dan Williams and the resulting discussion.
+
+    https://phabricator.endlessm.com/T24358
+    https://phabricator.endlessm.com/T29119
+
+    Signed-off-by: Daniel Drake <drake@endlessm.com>
+
+  - PCI: Fix order of remapped NVMe devices
+---
+ arch/x86/include/asm/pci.h                |   6 +
+ arch/x86/pci/common.c                     |   7 +-
+ drivers/ata/ahci.c                        |  23 +-
+ drivers/pci/controller/Makefile           |   6 +
+ drivers/pci/controller/intel-nvme-remap.c | 462 ++++++++++++++++++++++
+ 5 files changed, 488 insertions(+), 16 deletions(-)
+ create mode 100644 drivers/pci/controller/intel-nvme-remap.c
+
+diff --git a/arch/x86/include/asm/pci.h b/arch/x86/include/asm/pci.h
+index b3ab80a03365cf..5e883b397ff3f2 100644
+--- a/arch/x86/include/asm/pci.h
++++ b/arch/x86/include/asm/pci.h
+@@ -26,6 +26,7 @@ struct pci_sysdata {
+ #if IS_ENABLED(CONFIG_VMD)
+ 	struct pci_dev	*vmd_dev;	/* VMD Device if in Intel VMD domain */
+ #endif
++	struct pci_dev	*nvme_remap_dev;	/* AHCI Device if NVME remapped bus */
+ };
+ 
+ extern int pci_routeirq;
+@@ -69,6 +70,11 @@ static inline bool is_vmd(struct pci_bus *bus)
+ #define is_vmd(bus)		false
+ #endif /* CONFIG_VMD */
+ 
++static inline bool is_nvme_remap(struct pci_bus *bus)
++{
++	return to_pci_sysdata(bus)->nvme_remap_dev != NULL;
++}
++
+ /* Can be used to override the logic in pci_scan_bus for skipping
+    already-configured bus numbers - to be used for buggy BIOSes
+    or architectures with incomplete PCI setup by the loader */
+diff --git a/arch/x86/pci/common.c b/arch/x86/pci/common.c
+index ddb798603201ef..7c20387d82029a 100644
+--- a/arch/x86/pci/common.c
++++ b/arch/x86/pci/common.c
+@@ -723,12 +723,15 @@ int pci_ext_cfg_avail(void)
+ 		return 0;
+ }
+ 
+-#if IS_ENABLED(CONFIG_VMD)
+ struct pci_dev *pci_real_dma_dev(struct pci_dev *dev)
+ {
++#if IS_ENABLED(CONFIG_VMD)
+ 	if (is_vmd(dev->bus))
+ 		return to_pci_sysdata(dev->bus)->vmd_dev;
++#endif
++
++	if (is_nvme_remap(dev->bus))
++		return to_pci_sysdata(dev->bus)->nvme_remap_dev;
+ 
+ 	return dev;
+ }
+-#endif
+diff --git a/drivers/ata/ahci.c b/drivers/ata/ahci.c
+index fc6fd583faf8a7..f79e205a51dd1a 100644
+--- a/drivers/ata/ahci.c
++++ b/drivers/ata/ahci.c
+@@ -1618,7 +1618,7 @@ static irqreturn_t ahci_thunderx_irq_handler(int irq, void *dev_instance)
+ }
+ #endif
+ 
+-static void ahci_remap_check(struct pci_dev *pdev, int bar,
++static int ahci_remap_check(struct pci_dev *pdev, int bar,
+ 		struct ahci_host_priv *hpriv)
+ {
+ 	int i;
+@@ -1631,7 +1631,7 @@ static void ahci_remap_check(struct pci_dev *pdev, int bar,
+ 	    pci_resource_len(pdev, bar) < SZ_512K ||
+ 	    bar != AHCI_PCI_BAR_STANDARD ||
+ 	    !(readl(hpriv->mmio + AHCI_VSCAP) & 1))
+-		return;
++		return 0;
+ 
+ 	cap = readq(hpriv->mmio + AHCI_REMAP_CAP);
+ 	for (i = 0; i < AHCI_MAX_REMAP; i++) {
+@@ -1646,18 +1646,11 @@ static void ahci_remap_check(struct pci_dev *pdev, int bar,
+ 	}
+ 
+ 	if (!hpriv->remapped_nvme)
+-		return;
+-
+-	dev_warn(&pdev->dev, "Found %u remapped NVMe devices.\n",
+-		 hpriv->remapped_nvme);
+-	dev_warn(&pdev->dev,
+-		 "Switch your BIOS from RAID to AHCI mode to use them.\n");
++		return 0;
+ 
+-	/*
+-	 * Don't rely on the msi-x capability in the remap case,
+-	 * share the legacy interrupt across ahci and remapped devices.
+-	 */
+-	hpriv->flags |= AHCI_HFLAG_NO_MSI;
++	/* Abort probe, allowing intel-nvme-remap to step in when available */
++	dev_info(&pdev->dev, "Device will be handled by intel-nvme-remap.\n");
++	return -ENODEV;
+ }
+ 
+ static int ahci_get_irq_vector(struct ata_host *host, int port)
+@@ -1894,7 +1887,9 @@ static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	hpriv->mmio = pcim_iomap_table(pdev)[ahci_pci_bar];
+ 
+ 	/* detect remapped nvme devices */
+-	ahci_remap_check(pdev, ahci_pci_bar, hpriv);
++	rc = ahci_remap_check(pdev, ahci_pci_bar, hpriv);
++	if (rc)
++		return rc;
+ 
+ 	sysfs_add_file_to_group(&pdev->dev.kobj,
+ 				&dev_attr_remapped_nvme.attr,
+diff --git a/drivers/pci/controller/Makefile b/drivers/pci/controller/Makefile
+index f2b19e6174afd7..4fef4b1743210e 100644
+--- a/drivers/pci/controller/Makefile
++++ b/drivers/pci/controller/Makefile
+@@ -1,4 +1,10 @@
+ # SPDX-License-Identifier: GPL-2.0
++ifdef CONFIG_X86_64
++ifdef CONFIG_SATA_AHCI
++obj-y += intel-nvme-remap.o
++endif
++endif
++
+ obj-$(CONFIG_PCIE_CADENCE) += cadence/
+ obj-$(CONFIG_PCI_FTPCI100) += pci-ftpci100.o
+ obj-$(CONFIG_PCI_IXP4XX) += pci-ixp4xx.o
+diff --git a/drivers/pci/controller/intel-nvme-remap.c b/drivers/pci/controller/intel-nvme-remap.c
+new file mode 100644
+index 00000000000000..e105e6f5cc91d1
+--- /dev/null
++++ b/drivers/pci/controller/intel-nvme-remap.c
+@@ -0,0 +1,462 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Intel remapped NVMe device support.
++ *
++ * Copyright (c) 2019 Endless Mobile, Inc.
++ * Author: Daniel Drake <drake@endlessm.com>
++ *
++ * Some products ship by default with the SATA controller in "RAID" or
++ * "Intel RST Premium With Intel Optane System Acceleration" mode. Under this
++ * mode, which we refer to as "remapped NVMe" mode, any installed NVMe
++ * devices disappear from the PCI bus, and instead their I/O memory becomes
++ * available within the AHCI device BARs.
++ *
++ * This scheme is understood to be a way of avoiding usage of the standard
++ * Windows NVMe driver under that OS, instead mandating usage of Intel's
++ * driver instead, which has better power management, and presumably offers
++ * some RAID/disk-caching solutions too.
++ *
++ * Here in this driver, we support the remapped NVMe mode by claiming the
++ * AHCI device and creating a fake PCIe root port. On the new bus, the
++ * original AHCI device is exposed with only minor tweaks. Then, fake PCI
++ * devices corresponding to the remapped NVMe devices are created. The usual
++ * ahci and nvme drivers are then expected to bind to these devices and
++ * operate as normal.
++ *
++ * The PCI configuration space for the NVMe devices is completely
++ * unavailable, so we fake a minimal one and hope for the best.
++ *
++ * Interrupts are shared between the AHCI and NVMe devices. For simplicity,
++ * we only support the legacy interrupt here, although MSI support
++ * could potentially be added later.
++ */
++
++#define MODULE_NAME "intel-nvme-remap"
++
++#include <linux/ahci-remap.h>
++#include <linux/irq.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++
++#define AHCI_PCI_BAR_STANDARD 5
++
++struct nvme_remap_dev {
++	struct pci_dev		*dev;		/* AHCI device */
++	struct pci_bus		*bus;		/* our fake PCI bus */
++	struct pci_sysdata	sysdata;
++	int			irq_base;	/* our fake interrupts */
++
++	/*
++	 * When we detect an all-ones write to a BAR register, this flag
++	 * is set, so that we return the BAR size on the next read (a
++	 * standard PCI behaviour).
++	 * This includes the assumption that an all-ones BAR write is
++	 * immediately followed by a read of the same register.
++	 */
++	bool			bar_sizing;
++
++	/*
++	 * Resources copied from the AHCI device, to be regarded as
++	 * resources on our fake bus.
++	 */
++	struct resource		ahci_resources[PCI_NUM_RESOURCES];
++
++	/* Resources corresponding to the NVMe devices. */
++	struct resource		remapped_dev_mem[AHCI_MAX_REMAP];
++
++	/* Number of remapped NVMe devices found. */
++	int			num_remapped_devices;
++};
++
++static inline struct nvme_remap_dev *nrdev_from_bus(struct pci_bus *bus)
++{
++	return container_of(bus->sysdata, struct nvme_remap_dev, sysdata);
++}
++
++
++/******** PCI configuration space **********/
++
++/*
++ * Helper macros for tweaking returned contents of PCI configuration space.
++ *
++ * value contains len bytes of data read from reg.
++ * If fixup_reg is included in that range, fix up the contents of that
++ * register to fixed_value.
++ */
++#define NR_FIX8(fixup_reg, fixed_value) do { \
++		if (reg <= fixup_reg && fixup_reg < reg + len) \
++			((u8 *) value)[fixup_reg - reg] = (u8) (fixed_value); \
++	} while (0)
++
++#define NR_FIX16(fixup_reg, fixed_value) do { \
++		NR_FIX8(fixup_reg, fixed_value); \
++		NR_FIX8(fixup_reg + 1, fixed_value >> 8); \
++	} while (0)
++
++#define NR_FIX24(fixup_reg, fixed_value) do { \
++		NR_FIX8(fixup_reg, fixed_value); \
++		NR_FIX8(fixup_reg + 1, fixed_value >> 8); \
++		NR_FIX8(fixup_reg + 2, fixed_value >> 16); \
++	} while (0)
++
++#define NR_FIX32(fixup_reg, fixed_value) do { \
++		NR_FIX16(fixup_reg, (u16) fixed_value); \
++		NR_FIX16(fixup_reg + 2, fixed_value >> 16); \
++	} while (0)
++
++/*
++ * Read PCI config space of the slot 0 (AHCI) device.
++ * We pass through the read request to the underlying device, but
++ * tweak the results in some cases.
++ */
++static int nvme_remap_pci_read_slot0(struct pci_bus *bus, int reg,
++				     int len, u32 *value)
++{
++	struct nvme_remap_dev *nrdev = nrdev_from_bus(bus);
++	struct pci_bus *ahci_dev_bus = nrdev->dev->bus;
++	int ret;
++
++	ret = ahci_dev_bus->ops->read(ahci_dev_bus, nrdev->dev->devfn,
++				      reg, len, value);
++	if (ret)
++		return ret;
++
++	/*
++	 * Adjust the device class, to prevent this driver from attempting to
++	 * additionally probe the device we're simulating here.
++	 */
++	NR_FIX24(PCI_CLASS_PROG, PCI_CLASS_STORAGE_SATA_AHCI);
++
++	/*
++	 * Unset interrupt pin, otherwise ACPI tries to find routing
++	 * info for our virtual IRQ, fails, and complains.
++	 */
++	NR_FIX8(PCI_INTERRUPT_PIN, 0);
++
++	/*
++	 * Truncate the AHCI BAR to not include the region that covers the
++	 * hidden devices. This will cause the ahci driver to successfully
++	 * probe th new device (instead of handing it over to this driver).
++	 */
++	if (nrdev->bar_sizing) {
++		NR_FIX32(PCI_BASE_ADDRESS_5, ~(SZ_16K - 1));
++		nrdev->bar_sizing = false;
++	}
++
++	return PCIBIOS_SUCCESSFUL;
++}
++
++/*
++ * Read PCI config space of a remapped device.
++ * Since the original PCI config space is inaccessible, we provide a minimal,
++ * fake config space instead.
++ */
++static int nvme_remap_pci_read_remapped(struct pci_bus *bus, unsigned int port,
++					int reg, int len, u32 *value)
++{
++	struct nvme_remap_dev *nrdev = nrdev_from_bus(bus);
++	struct resource *remapped_mem;
++
++	if (port > nrdev->num_remapped_devices)
++		return PCIBIOS_DEVICE_NOT_FOUND;
++
++	*value = 0;
++	remapped_mem = &nrdev->remapped_dev_mem[port - 1];
++
++	/* Set a Vendor ID, otherwise Linux assumes no device is present */
++	NR_FIX16(PCI_VENDOR_ID, PCI_VENDOR_ID_INTEL);
++
++	/* Always appear on & bus mastering */
++	NR_FIX16(PCI_COMMAND, PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
++
++	/* Set class so that nvme driver probes us */
++	NR_FIX24(PCI_CLASS_PROG, PCI_CLASS_STORAGE_EXPRESS);
++
++	if (nrdev->bar_sizing) {
++		NR_FIX32(PCI_BASE_ADDRESS_0,
++			 ~(resource_size(remapped_mem) - 1));
++		nrdev->bar_sizing = false;
++	} else {
++		resource_size_t mem_start = remapped_mem->start;
++
++		mem_start |= PCI_BASE_ADDRESS_MEM_TYPE_64;
++		NR_FIX32(PCI_BASE_ADDRESS_0, mem_start);
++		mem_start >>= 32;
++		NR_FIX32(PCI_BASE_ADDRESS_1, mem_start);
++	}
++
++	return PCIBIOS_SUCCESSFUL;
++}
++
++/* Read PCI configuration space. */
++static int nvme_remap_pci_read(struct pci_bus *bus, unsigned int devfn,
++			       int reg, int len, u32 *value)
++{
++	if (PCI_SLOT(devfn) == 0)
++		return nvme_remap_pci_read_slot0(bus, reg, len, value);
++	else
++		return nvme_remap_pci_read_remapped(bus, PCI_SLOT(devfn),
++						    reg, len, value);
++}
++
++/*
++ * Write PCI config space of the slot 0 (AHCI) device.
++ * Apart from the special case of BAR sizing, we disable all writes.
++ * Otherwise, the ahci driver could make changes (e.g. unset PCI bus master)
++ * that would affect the operation of the NVMe devices.
++ */
++static int nvme_remap_pci_write_slot0(struct pci_bus *bus, int reg,
++				      int len, u32 value)
++{
++	struct nvme_remap_dev *nrdev = nrdev_from_bus(bus);
++	struct pci_bus *ahci_dev_bus = nrdev->dev->bus;
++
++	if (reg >= PCI_BASE_ADDRESS_0 && reg <= PCI_BASE_ADDRESS_5) {
++		/*
++		 * Writing all-ones to a BAR means that the size of the
++		 * memory region is being checked. Flag this so that we can
++		 * reply with an appropriate size on the next read.
++		 */
++		if (value == ~0)
++			nrdev->bar_sizing = true;
++
++		return ahci_dev_bus->ops->write(ahci_dev_bus,
++						nrdev->dev->devfn,
++						reg, len, value);
++	}
++
++	return PCIBIOS_SET_FAILED;
++}
++
++/*
++ * Write PCI config space of a remapped device.
++ * Since the original PCI config space is inaccessible, we reject all
++ * writes, except for the special case of BAR probing.
++ */
++static int nvme_remap_pci_write_remapped(struct pci_bus *bus,
++					 unsigned int port,
++					 int reg, int len, u32 value)
++{
++	struct nvme_remap_dev *nrdev = nrdev_from_bus(bus);
++
++	if (port > nrdev->num_remapped_devices)
++		return PCIBIOS_DEVICE_NOT_FOUND;
++
++	/*
++	 * Writing all-ones to a BAR means that the size of the memory
++	 * region is being checked. Flag this so that we can reply with
++	 * an appropriate size on the next read.
++	 */
++	if (value == ~0 && reg >= PCI_BASE_ADDRESS_0
++			&& reg <= PCI_BASE_ADDRESS_5) {
++		nrdev->bar_sizing = true;
++		return PCIBIOS_SUCCESSFUL;
++	}
++
++	return PCIBIOS_SET_FAILED;
++}
++
++/* Write PCI configuration space. */
++static int nvme_remap_pci_write(struct pci_bus *bus, unsigned int devfn,
++				int reg, int len, u32 value)
++{
++	if (PCI_SLOT(devfn) == 0)
++		return nvme_remap_pci_write_slot0(bus, reg, len, value);
++	else
++		return nvme_remap_pci_write_remapped(bus, PCI_SLOT(devfn),
++						     reg, len, value);
++}
++
++static struct pci_ops nvme_remap_pci_ops = {
++	.read	= nvme_remap_pci_read,
++	.write	= nvme_remap_pci_write,
++};
++
++
++/******** Initialization & exit **********/
++
++/*
++ * Find a PCI domain ID to use for our fake bus.
++ * Start at 0x10000 to not clash with ACPI _SEG domains (16 bits).
++ */
++static int find_free_domain(void)
++{
++	int domain = 0xffff;
++	struct pci_bus *bus = NULL;
++
++	while ((bus = pci_find_next_bus(bus)) != NULL)
++		domain = max_t(int, domain, pci_domain_nr(bus));
++
++	return domain + 1;
++}
++
++static int find_remapped_devices(struct nvme_remap_dev *nrdev,
++				 struct list_head *resources)
++{
++	void __iomem *mmio;
++	int i, count = 0;
++	u32 cap;
++
++	mmio = pcim_iomap(nrdev->dev, AHCI_PCI_BAR_STANDARD,
++			  pci_resource_len(nrdev->dev,
++					   AHCI_PCI_BAR_STANDARD));
++	if (!mmio)
++		return -ENODEV;
++
++	/* Check if this device might have remapped nvme devices. */
++	if (pci_resource_len(nrdev->dev, AHCI_PCI_BAR_STANDARD) < SZ_512K ||
++	    !(readl(mmio + AHCI_VSCAP) & 1))
++		return -ENODEV;
++
++	cap = readq(mmio + AHCI_REMAP_CAP);
++	for (i = AHCI_MAX_REMAP-1; i >= 0; i--) {
++		struct resource *remapped_mem;
++
++		if ((cap & (1 << i)) == 0)
++			continue;
++		if (readl(mmio + ahci_remap_dcc(i))
++				!= PCI_CLASS_STORAGE_EXPRESS)
++			continue;
++
++		/* We've found a remapped device */
++		remapped_mem = &nrdev->remapped_dev_mem[count++];
++		remapped_mem->start =
++			pci_resource_start(nrdev->dev, AHCI_PCI_BAR_STANDARD)
++			+ ahci_remap_base(i);
++		remapped_mem->end = remapped_mem->start
++			+ AHCI_REMAP_N_SIZE - 1;
++		remapped_mem->flags = IORESOURCE_MEM | IORESOURCE_PCI_FIXED;
++		pci_add_resource(resources, remapped_mem);
++	}
++
++	pcim_iounmap(nrdev->dev, mmio);
++
++	if (count == 0)
++		return -ENODEV;
++
++	nrdev->num_remapped_devices = count;
++	dev_info(&nrdev->dev->dev, "Found %d remapped NVMe devices\n",
++		 nrdev->num_remapped_devices);
++	return 0;
++}
++
++static void nvme_remap_remove_root_bus(void *data)
++{
++	struct pci_bus *bus = data;
++
++	pci_stop_root_bus(bus);
++	pci_remove_root_bus(bus);
++}
++
++static int nvme_remap_probe(struct pci_dev *dev,
++			    const struct pci_device_id *id)
++{
++	struct nvme_remap_dev *nrdev;
++	LIST_HEAD(resources);
++	int i;
++	int ret;
++	struct pci_dev *child;
++
++	nrdev = devm_kzalloc(&dev->dev, sizeof(*nrdev), GFP_KERNEL);
++	nrdev->sysdata.domain = find_free_domain();
++	nrdev->sysdata.nvme_remap_dev = dev;
++	nrdev->dev = dev;
++	pci_set_drvdata(dev, nrdev);
++
++	ret = pcim_enable_device(dev);
++	if (ret < 0)
++		return ret;
++
++	pci_set_master(dev);
++
++	ret = find_remapped_devices(nrdev, &resources);
++	if (ret)
++		return ret;
++
++	/* Add resources from the original AHCI device */
++	for (i = 0; i < PCI_NUM_RESOURCES; i++) {
++		struct resource *res = &dev->resource[i];
++
++		if (res->start) {
++			struct resource *nr_res = &nrdev->ahci_resources[i];
++
++			nr_res->start = res->start;
++			nr_res->end = res->end;
++			nr_res->flags = res->flags;
++			pci_add_resource(&resources, nr_res);
++		}
++	}
++
++	/* Create virtual interrupts */
++	nrdev->irq_base = devm_irq_alloc_descs(&dev->dev, -1, 0,
++					       nrdev->num_remapped_devices + 1,
++					       0);
++	if (nrdev->irq_base < 0)
++		return nrdev->irq_base;
++
++	/* Create and populate PCI bus */
++	nrdev->bus = pci_create_root_bus(&dev->dev, 0, &nvme_remap_pci_ops,
++					 &nrdev->sysdata, &resources);
++	if (!nrdev->bus)
++		return -ENODEV;
++
++	if (devm_add_action_or_reset(&dev->dev, nvme_remap_remove_root_bus,
++				     nrdev->bus))
++		return -ENOMEM;
++
++	/* We don't support sharing MSI interrupts between these devices */
++	nrdev->bus->bus_flags |= PCI_BUS_FLAGS_NO_MSI;
++
++	pci_scan_child_bus(nrdev->bus);
++
++	list_for_each_entry(child, &nrdev->bus->devices, bus_list) {
++		/*
++		 * Prevent PCI core from trying to move memory BARs around.
++		 * The hidden NVMe devices are at fixed locations.
++		 */
++		for (i = 0; i < PCI_NUM_RESOURCES; i++) {
++			struct resource *res = &child->resource[i];
++
++			if (res->flags & IORESOURCE_MEM)
++				res->flags |= IORESOURCE_PCI_FIXED;
++		}
++
++		/* Share the legacy IRQ between all devices */
++		child->irq = dev->irq;
++	}
++
++	pci_assign_unassigned_bus_resources(nrdev->bus);
++	pci_bus_add_devices(nrdev->bus);
++
++	return 0;
++}
++
++static const struct pci_device_id nvme_remap_ids[] = {
++	/*
++	 * Match all Intel RAID controllers.
++	 *
++	 * There's overlap here with the set of devices detected by the ahci
++	 * driver, but ahci will only successfully probe when there
++	 * *aren't* any remapped NVMe devices, and this driver will only
++	 * successfully probe when there *are* remapped NVMe devices that
++	 * need handling.
++	 */
++	{
++		PCI_VDEVICE(INTEL, PCI_ANY_ID),
++		.class = PCI_CLASS_STORAGE_RAID << 8,
++		.class_mask = 0xffffff00,
++	},
++	{0,}
++};
++MODULE_DEVICE_TABLE(pci, nvme_remap_ids);
++
++static struct pci_driver nvme_remap_drv = {
++	.name		= MODULE_NAME,
++	.id_table	= nvme_remap_ids,
++	.probe		= nvme_remap_probe,
++};
++module_pci_driver(nvme_remap_drv);
++
++MODULE_AUTHOR("Daniel Drake <drake@endlessm.com>");
++MODULE_LICENSE("GPL v2");
+From 4a69dce0c0a5bc21732a8bc0b34f7ff2900ee8ce Mon Sep 17 00:00:00 2001
+From: "Jan Alexander Steffens (heftig)" <heftig@archlinux.org>
+Date: Sun, 11 Dec 2022 23:51:16 +0100
+Subject: [PATCH] ZEN: Restore CONFIG_OPTIMIZE_FOR_PERFORMANCE_O3
+
+This reverts a6036a41bffba3d5007e377483b425d470ad8042 (kbuild: drop
+support for CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3), removes the
+dependency on CONFIG_ARC and adds RUSTFLAGS.
+---
+ Makefile     | 3 +++
+ init/Kconfig | 6 ++++++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/Makefile b/Makefile
+index 3666853fb9e0e2..46d93a455ade6e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -817,6 +817,9 @@ KBUILD_CFLAGS	+= -fno-delete-null-pointer-checks
+ ifdef CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE
+ KBUILD_CFLAGS += -O2
+ KBUILD_RUSTFLAGS += -Copt-level=2
++else ifdef CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3
++KBUILD_CFLAGS += -O3
++KBUILD_RUSTFLAGS += -Copt-level=3
+ else ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
+ KBUILD_CFLAGS += -Os
+ KBUILD_RUSTFLAGS += -Copt-level=s
+diff --git a/init/Kconfig b/init/Kconfig
+index febdea2afc3be3..bda44f9f77c4fd 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1393,6 +1393,12 @@ config CC_OPTIMIZE_FOR_PERFORMANCE
+ 	  with the "-O2" compiler flag for best performance and most
+ 	  helpful compile-time warnings.
+ 
++config CC_OPTIMIZE_FOR_PERFORMANCE_O3
++	bool "Optimize more for performance (-O3)"
++	help
++	  Choosing this option will pass "-O3" to your compiler to optimize
++	  the kernel yet more for performance.
++
+ config CC_OPTIMIZE_FOR_SIZE
+ 	bool "Optimize for size (-Os)"
+ 	help
+From 30ee88fd481b3aff9cfa8523da4e1c11b997f61c Mon Sep 17 00:00:00 2001
+From: Sultan Alsawaf <sultan@kerneltoast.com>
+Date: Sun, 8 Mar 2020 00:31:35 -0800
+Subject: [PATCH] ZEN: Disable stack conservation for GCC
+
+There's plenty of room on the stack for a few more inlined bytes here
+and there. The measured stack usage at runtime is still safe without
+this, and performance is surely improved at a microscopic level, so
+remove it.
+
+Signed-off-by: Sultan Alsawaf <sultan@kerneltoast.com>
+---
+ Makefile | 5 -----
+ 1 file changed, 5 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 46d93a455ade6e..2582857eb69d8e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1008,11 +1008,6 @@ KBUILD_CFLAGS	+= -fno-strict-overflow
+ # Make sure -fstack-check isn't enabled (like gentoo apparently did)
+ KBUILD_CFLAGS  += -fno-stack-check
+ 
+-# conserve stack if available
+-ifdef CONFIG_CC_IS_GCC
+-KBUILD_CFLAGS   += -fconserve-stack
+-endif
+-
+ # change __FILE__ to the relative path from the srctree
+ KBUILD_CPPFLAGS += $(call cc-option,-fmacro-prefix-map=$(srctree)/=)
+
+From 3e0cd5773745d0f6d4d505235c0563b68745708a Mon Sep 17 00:00:00 2001
+From: Arjan van de Ven <arjan@linux.intel.com>
+Date: Thu, 2 Jun 2016 23:36:32 -0500
+Subject: [PATCH] ZEN: Initialize ata before graphics
+
+ATA init is the long pole in the boot process, and its asynchronous.
+move the graphics init after it so that ata and graphics initialize
+in parallel
+---
+ drivers/Makefile | 13 +++++++------
+ 1 file changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/Makefile b/drivers/Makefile
+index fe9ceb0d2288ad..b58955caf19bfb 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -61,14 +61,8 @@ obj-y				+= char/
+ # iommu/ comes before gpu as gpu are using iommu controllers
+ obj-y				+= iommu/
+ 
+-# gpu/ comes after char for AGP vs DRM startup and after iommu
+-obj-y				+= gpu/
+-
+ obj-$(CONFIG_CONNECTOR)		+= connector/
+ 
+-# i810fb depends on char/agp/
+-obj-$(CONFIG_FB_I810)           += video/fbdev/i810/
+-
+ obj-$(CONFIG_PARPORT)		+= parport/
+ obj-y				+= base/ block/ misc/ mfd/ nfc/
+ obj-$(CONFIG_LIBNVDIMM)		+= nvdimm/
+@@ -80,6 +74,13 @@ obj-y				+= macintosh/
+ obj-y				+= scsi/
+ obj-y				+= nvme/
+ obj-$(CONFIG_ATA)		+= ata/
++
++# gpu/ comes after char for AGP vs DRM startup and after iommu
++obj-y				+= gpu/
++
++# i810fb depends on char/agp/
++obj-$(CONFIG_FB_I810)           += video/fbdev/i810/
++
+ obj-$(CONFIG_TARGET_CORE)	+= target/
+ obj-$(CONFIG_MTD)		+= mtd/
+ obj-$(CONFIG_SPI)		+= spi/
+From 1f8caf918d491308e1988027203e3db830e17974 Mon Sep 17 00:00:00 2001
+From: Kenny Levinsen <kl@kl.wtf>
+Date: Sun, 27 Dec 2020 14:43:13 +0000
+Subject: [PATCH] ZEN: Input: evdev - use call_rcu when detaching client
+
+Significant time was spent on synchronize_rcu in evdev_detach_client
+when applications closed evdev devices. Switching VT away from a
+graphical environment commonly leads to mass input device closures,
+which could lead to noticable delays on systems with many input devices.
+
+Replace synchronize_rcu with call_rcu, deferring reclaim of the evdev
+client struct till after the RCU grace period instead of blocking the
+calling application.
+
+While this does not solve all slow evdev fd closures, it takes care of a
+good portion of them, including this simple test:
+
+	#include <fcntl.h>
+	#include <unistd.h>
+
+	int main(int argc, char *argv[])
+	{
+		int idx, fd;
+		const char *path = "/dev/input/event0";
+		for (idx = 0; idx < 1000; idx++) {
+			if ((fd = open(path, O_RDWR)) == -1) {
+				return -1;
+			}
+			close(fd);
+		}
+		return 0;
+	}
+
+Time to completion of above test when run locally:
+
+	Before: 0m27.111s
+	After:  0m0.018s
+
+Signed-off-by: Kenny Levinsen <kl@kl.wtf>
+---
+ drivers/input/evdev.c | 19 +++++++++++--------
+ 1 file changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/input/evdev.c b/drivers/input/evdev.c
+index 51e0c495460019..35c3ad74187072 100644
+--- a/drivers/input/evdev.c
++++ b/drivers/input/evdev.c
+@@ -46,6 +46,7 @@ struct evdev_client {
+ 	struct fasync_struct *fasync;
+ 	struct evdev *evdev;
+ 	struct list_head node;
++	struct rcu_head rcu;
+ 	enum input_clock_type clk_type;
+ 	bool revoked;
+ 	unsigned long *evmasks[EV_CNT];
+@@ -377,13 +378,22 @@ static void evdev_attach_client(struct evdev *evdev,
+ 	spin_unlock(&evdev->client_lock);
+ }
+ 
++static void evdev_reclaim_client(struct rcu_head *rp)
++{
++	struct evdev_client *client = container_of(rp, struct evdev_client, rcu);
++	unsigned int i;
++	for (i = 0; i < EV_CNT; ++i)
++		bitmap_free(client->evmasks[i]);
++	kvfree(client);
++}
++
+ static void evdev_detach_client(struct evdev *evdev,
+ 				struct evdev_client *client)
+ {
+ 	spin_lock(&evdev->client_lock);
+ 	list_del_rcu(&client->node);
+ 	spin_unlock(&evdev->client_lock);
+-	synchronize_rcu();
++	call_rcu(&client->rcu, evdev_reclaim_client);
+ }
+ 
+ static int evdev_open_device(struct evdev *evdev)
+@@ -436,7 +446,6 @@ static int evdev_release(struct inode *inode, struct file *file)
+ {
+ 	struct evdev_client *client = file->private_data;
+ 	struct evdev *evdev = client->evdev;
+-	unsigned int i;
+ 
+ 	mutex_lock(&evdev->mutex);
+ 
+@@ -448,11 +457,6 @@ static int evdev_release(struct inode *inode, struct file *file)
+ 
+ 	evdev_detach_client(evdev, client);
+ 
+-	for (i = 0; i < EV_CNT; ++i)
+-		bitmap_free(client->evmasks[i]);
+-
+-	kvfree(client);
+-
+ 	evdev_close_device(evdev);
+ 
+ 	return 0;
+@@ -495,7 +499,6 @@ static int evdev_open(struct inode *inode, struct file *file)
+ 
+  err_free_client:
+ 	evdev_detach_client(evdev, client);
+-	kvfree(client);
+ 	return error;
+ }
+
+From 32f9f31d03611ba9bd7526af62b52589001460fb Mon Sep 17 00:00:00 2001
+From: Steven Barrett <steven@liquorix.net>
+Date: Wed, 15 Jan 2020 20:43:56 -0600
+Subject: [PATCH] ZEN: intel-pstate: Implement "enable" parameter
+
+If intel-pstate is compiled into the kernel, it will preempt the loading
+of acpi-cpufreq so you can take advantage of hardware p-states without
+any friction.
+
+However, intel-pstate is not completely superior to cpufreq's ondemand
+for one reason.  There's no concept of an up_threshold property.
+
+In ondemand, up_threshold essentially reduces the maximum utilization to
+compare against, allowing you to hit max frequencies and turbo boost
+from a much lower core utilization.
+
+With intel-pstate, you have the concept of minimum and maximum
+performance, but no tunable that lets you define, maximum frequency
+means 50% core utilization.  For just this oversight, there's reasons
+you may want ondemand.
+
+Lets support setting "enable" in kernel boot parameters.  This lets
+kernel maintainers include "intel_pstate=disable" statically in the
+static boot parameters, but let users of the kernel override this
+selection.
+---
+ Documentation/admin-guide/kernel-parameters.txt | 3 +++
+ drivers/cpufreq/intel_pstate.c                  | 2 ++
+ 2 files changed, 5 insertions(+)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index db94b472543f5e..07ac4c81a7ddd0 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -2229,6 +2229,9 @@
+ 			disable
+ 			  Do not enable intel_pstate as the default
+ 			  scaling driver for the supported processors
++			enable
++			  Enable intel_pstate in-case "disable" was passed
++			  previously in the kernel boot parameters
+                         active
+                           Use intel_pstate driver to bypass the scaling
+                           governors layer of cpufreq and provides it own
+diff --git a/drivers/cpufreq/intel_pstate.c b/drivers/cpufreq/intel_pstate.c
+index c31914a9876fa1..1035c074f36a43 100644
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@ -3550,6 +3550,8 @@ static int __init intel_pstate_setup(char *str)
+ 
+ 	if (!strcmp(str, "disable"))
+ 		no_load = 1;
++	else if (!strcmp(str, "enable"))
++		no_load = 0;
+ 	else if (!strcmp(str, "active"))
+ 		default_driver = &intel_pstate;
+ 	else if (!strcmp(str, "passive"))
+From f61fea137cc64dc793ac3939a3f5eec5a7584951 Mon Sep 17 00:00:00 2001
+From: Sultan Alsawaf <sultan@kerneltoast.com>
+Date: Sun, 19 Apr 2020 19:59:18 -0700
+Subject: [PATCH] ZEN: mm: Stop kswapd early when nothing's waiting for it to
+ free pages
+
+Contains:
+  - mm: Stop kswapd early when nothing's waiting for it to free pages
+
+    Keeping kswapd running when all the failed allocations that invoked it
+    are satisfied incurs a high overhead due to unnecessary page eviction
+    and writeback, as well as spurious VM pressure events to various
+    registered shrinkers. When kswapd doesn't need to work to make an
+    allocation succeed anymore, stop it prematurely to save resources.
+
+    Signed-off-by: Sultan Alsawaf <sultan@kerneltoast.com>
+
+  - mm: Don't stop kswapd on a per-node basis when there are no waiters
+
+    The page allocator wakes all kswapds in an allocation context's allowed
+    nodemask in the slow path, so it doesn't make sense to have the kswapd-
+    waiter count per each NUMA node. Instead, it should be a global counter
+    to stop all kswapds when there are no failed allocation requests.
+
+    Signed-off-by: Sultan Alsawaf <sultan@kerneltoast.com>
+
+  - mm: Increment kswapd_waiters for throttled direct reclaimers
+
+    Throttled direct reclaimers will wake up kswapd and wait for kswapd to
+    satisfy their page allocation request, even when the failed allocation
+    lacks the __GFP_KSWAPD_RECLAIM flag in its gfp mask. As a result, kswapd
+    may think that there are no waiters and thus exit prematurely, causing
+    throttled direct reclaimers lacking __GFP_KSWAPD_RECLAIM to stall on
+    waiting for kswapd to wake them up. Incrementing the kswapd_waiters
+    counter when such direct reclaimers become throttled fixes the problem.
+
+    Signed-off-by: Sultan Alsawaf <sultan@kerneltoast.com>
+---
+ mm/internal.h   |  1 +
+ mm/page_alloc.c | 17 ++++++++++++++---
+ mm/vmscan.c     | 19 +++++++++++++------
+ 3 files changed, 28 insertions(+), 9 deletions(-)
+
+diff --git a/mm/internal.h b/mm/internal.h
+index cc2c5e07fad3ba..f232fdb8ec2c43 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -644,6 +644,7 @@ extern void post_alloc_hook(struct page *page, unsigned int order,
+ extern bool free_pages_prepare(struct page *page, unsigned int order);
+ 
+ extern int user_min_free_kbytes;
++extern atomic_long_t kswapd_waiters;
+ 
+ void free_unref_page(struct page *page, unsigned int order);
+ void free_unref_folios(struct folio_batch *fbatch);
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 9ecf99190ea201..ffd96274a9c40b 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -88,6 +88,8 @@ typedef int __bitwise fpi_t;
+  */
+ #define FPI_TO_TAIL		((__force fpi_t)BIT(1))
+ 
++atomic_long_t kswapd_waiters = ATOMIC_LONG_INIT(0);
++
+ /* prevent >1 _updater_ of zone percpu pageset ->high and ->batch fields */
+ static DEFINE_MUTEX(pcp_batch_high_lock);
+ #define MIN_PERCPU_PAGELIST_HIGH_FRACTION (8)
+@@ -4167,6 +4169,7 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 	unsigned int cpuset_mems_cookie;
+ 	unsigned int zonelist_iter_cookie;
+ 	int reserve_flags;
++	bool woke_kswapd = false;
+ 
+ restart:
+ 	compaction_retries = 0;
+@@ -4206,8 +4209,13 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 			goto nopage;
+ 	}
+ 
+-	if (alloc_flags & ALLOC_KSWAPD)
++	if (alloc_flags & ALLOC_KSWAPD) {
++		if (!woke_kswapd) {
++			atomic_long_inc(&kswapd_waiters);
++			woke_kswapd = true;
++		}
+ 		wake_all_kswapds(order, gfp_mask, ac);
++	}
+ 
+ 	/*
+ 	 * The adjusted alloc_flags might result in immediate success, so try
+@@ -4423,9 +4431,12 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 		goto retry;
+ 	}
+ fail:
+-	warn_alloc(gfp_mask, ac->nodemask,
+-			"page allocation failure: order:%u", order);
+ got_pg:
++	if (woke_kswapd)
++		atomic_long_dec(&kswapd_waiters);
++	if (!page)
++		warn_alloc(gfp_mask, ac->nodemask,
++				"page allocation failure: order:%u", order);
+ 	return page;
+ }
+ 
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 2e34de9cd0d4f7..46bae813d353da 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -6298,7 +6298,7 @@ static unsigned long do_try_to_free_pages(struct zonelist *zonelist,
+ 	return 0;
+ }
+ 
+-static bool allow_direct_reclaim(pg_data_t *pgdat)
++static bool allow_direct_reclaim(pg_data_t *pgdat, bool using_kswapd)
+ {
+ 	struct zone *zone;
+ 	unsigned long pfmemalloc_reserve = 0;
+@@ -6327,6 +6327,10 @@ static bool allow_direct_reclaim(pg_data_t *pgdat)
+ 
+ 	wmark_ok = free_pages > pfmemalloc_reserve / 2;
+ 
++	/* The throttled direct reclaimer is now a kswapd waiter */
++	if (unlikely(!using_kswapd && !wmark_ok))
++		atomic_long_inc(&kswapd_waiters);
++
+ 	/* kswapd must be awake if processes are being throttled */
+ 	if (!wmark_ok && waitqueue_active(&pgdat->kswapd_wait)) {
+ 		if (READ_ONCE(pgdat->kswapd_highest_zoneidx) > ZONE_NORMAL)
+@@ -6392,7 +6396,7 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
+ 
+ 		/* Throttle based on the first usable node */
+ 		pgdat = zone->zone_pgdat;
+-		if (allow_direct_reclaim(pgdat))
++		if (allow_direct_reclaim(pgdat, gfp_mask & __GFP_KSWAPD_RECLAIM))
+ 			goto out;
+ 		break;
+ 	}
+@@ -6414,11 +6418,14 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
+ 	 */
+ 	if (!(gfp_mask & __GFP_FS))
+ 		wait_event_interruptible_timeout(pgdat->pfmemalloc_wait,
+-			allow_direct_reclaim(pgdat), HZ);
++			allow_direct_reclaim(pgdat, true), HZ);
+ 	else
+ 		/* Throttle until kswapd wakes the process */
+ 		wait_event_killable(zone->zone_pgdat->pfmemalloc_wait,
+-			allow_direct_reclaim(pgdat));
++			allow_direct_reclaim(pgdat, true));
++
++	if (unlikely(!(gfp_mask & __GFP_KSWAPD_RECLAIM)))
++		atomic_long_dec(&kswapd_waiters);
+ 
+ 	if (fatal_signal_pending(current))
+ 		return true;
+@@ -6917,14 +6924,14 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
+ 		 * able to safely make forward progress. Wake them
+ 		 */
+ 		if (waitqueue_active(&pgdat->pfmemalloc_wait) &&
+-				allow_direct_reclaim(pgdat))
++				allow_direct_reclaim(pgdat, true))
+ 			wake_up_all(&pgdat->pfmemalloc_wait);
+ 
+ 		/* Check if kswapd should be suspending */
+ 		__fs_reclaim_release(_THIS_IP_);
+ 		ret = kthread_freezable_should_stop(&was_frozen);
+ 		__fs_reclaim_acquire(_THIS_IP_);
+-		if (was_frozen || ret)
++		if (was_frozen || ret || !atomic_long_read(&kswapd_waiters))
+ 			break;
+ 
+ 		/*

@@ -1,0 +1,92 @@
+This patch allows users to override the power limit range on AMD GPUs with the
+kernel parameter amdgpu.ignore_pcap_range=1. Based on the Zen kernel's patch to
+override just the minimum power limit.
+
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -133,6 +133,7 @@ enum AMDGPU_DEBUG_MASK {
+ 
+ unsigned int amdgpu_vram_limit = UINT_MAX;
+ int amdgpu_vis_vram_limit;
++int amdgpu_ignore_pcap_range = 0; /* do not ignore by default */
+ int amdgpu_gart_size = -1; /* auto */
+ int amdgpu_gtt_size = -1; /* auto */
+ int amdgpu_moverate = -1; /* auto */
+@@ -257,6 +258,15 @@ module_param_named(vramlimit, amdgpu_vram_limit, int, 0600);
+ MODULE_PARM_DESC(vis_vramlimit, "Restrict visible VRAM for testing, in megabytes");
+ module_param_named(vis_vramlimit, amdgpu_vis_vram_limit, int, 0444);
+ 
++/**
++ * DOC: ignore_pcap_range (int)
++ * Ignore the minimum and maximum power caps.
++ * Useful on graphics cards where the power cap range is too restrictive.
++ * The default is 0 (Do not ignore).
++ */
++MODULE_PARM_DESC(ignore_pcap_range, "Ignore the minimum and maximum power caps");
++module_param_named(ignore_pcap_range, amdgpu_ignore_pcap_range, int, 0600);
++
+ /**
+  * DOC: gartsize (uint)
+  * Restrict the size of GART (for kernel use) in Mib (32, 64, etc.) for testing.
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -160,6 +160,7 @@ struct amdgpu_watchdog_timer {
+ extern int amdgpu_modeset;
+ extern unsigned int amdgpu_vram_limit;
+ extern int amdgpu_vis_vram_limit;
++extern int amdgpu_ignore_pcap_range;
+ extern int amdgpu_gart_size;
+ extern int amdgpu_gtt_size;
+ extern int amdgpu_moverate;
+--- a/drivers/gpu/drm/amd/pm/amdgpu_pm.c
++++ b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
+@@ -3155,6 +3155,9 @@ static ssize_t amdgpu_hwmon_show_power_cap_min(struct device *dev,
+ 					 struct device_attribute *attr,
+ 					 char *buf)
+ {
++	if (amdgpu_ignore_pcap_range)
++		return sysfs_emit(buf, "%u\n", 0);
++
+ 	return amdgpu_hwmon_show_power_cap_generic(dev, attr, buf, PP_PWR_LIMIT_MIN);
+ }
+ 
+@@ -3162,6 +3165,9 @@ static ssize_t amdgpu_hwmon_show_power_cap_max(struct device *dev,
+ 					 struct device_attribute *attr,
+ 					 char *buf)
+ {
++	if (amdgpu_ignore_pcap_range)
++		return sysfs_emit(buf, "%u\n", U32_MAX);
++
+ 	return amdgpu_hwmon_show_power_cap_generic(dev, attr, buf, PP_PWR_LIMIT_MAX);
+ 
+ }
+--- a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+@@ -2746,10 +2746,16 @@ int smu_get_power_limit(void *handle,
+ 			*limit = smu->default_power_limit;
+ 			break;
+ 		case SMU_PPT_LIMIT_MAX:
+-			*limit = smu->max_power_limit;
++			if (amdgpu_ignore_pcap_range)
++				*limit = U32_MAX;
++			else
++				*limit = smu->max_power_limit;
+ 			break;
+ 		case SMU_PPT_LIMIT_MIN:
+-			*limit = smu->min_power_limit;
++			if (amdgpu_ignore_pcap_range)
++				*limit = 0;
++			else
++				*limit = smu->min_power_limit;
+ 			break;
+ 		default:
+ 			return -EINVAL;
+@@ -2773,7 +2779,7 @@ static int smu_set_power_limit(void *handle, uint32_t limit)
+ 		if (smu->ppt_funcs->set_power_limit)
+ 			return smu->ppt_funcs->set_power_limit(smu, limit_type, limit);
+ 
+-	if ((limit > smu->max_power_limit) || (limit < smu->min_power_limit)) {
++	if (!amdgpu_ignore_pcap_range && ((limit > smu->max_power_limit) || (limit < smu->min_power_limit))) {
+ 		dev_err(smu->adev->dev,
+ 			"New power limit (%d) is out of range [%d,%d]\n",
+ 			limit, smu->min_power_limit, smu->max_power_limit);
